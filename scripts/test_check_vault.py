@@ -83,6 +83,30 @@ class VaultTests(unittest.TestCase):
             ("source.md", 15, "missing file 'top-level-link'"),
         ])
 
+    def test_quoted_fences_ignore_examples_and_leave_quoted_prose_visible(self):
+        self.write("source.md", "\n".join([
+            "> ```md", "> [[backtick-example]]", "> ````", ">",
+            "> ~~~md", "> [[tilde-example]]", "> ~~~~", ">",
+            "> [[quoted-prose]]", "", "[[ordinary-prose]]",
+        ]))
+        self.assertEqual(check_vault(self.root), [
+            ("source.md", 9, "missing file 'quoted-prose'"),
+            ("source.md", 11, "missing file 'ordinary-prose'"),
+        ])
+
+    def test_unclosed_fences_end_with_the_list_item_or_block_quote(self):
+        cases = [
+            "- ```md\n  [[example]]\n\n[[prose]]\n",
+            "- ~~~md\n  [[example]]\n\n- [[prose]]\n",
+            "> ```md\n> [[example]]\n\n> [[prose]]\n",
+            "> - ~~~md\n>   [[example]]\n>\n> - [[prose]]\n",
+            "- > ~~~md\n  > [[example]]\n\n  [[prose]]\n",
+        ]
+        for content in cases:
+            with self.subTest(content=content):
+                self.write("source.md", content)
+                self.assertEqual(check_vault(self.root), [("source.md", 4, "missing file 'prose'")])
+
     def test_ignores_code_comments_front_matter_and_escaped_links(self):
         self.write("source.md", "\n".join([
             "---", 'example: "[[missing]]"', "---",

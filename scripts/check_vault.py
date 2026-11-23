@@ -13,10 +13,7 @@ CODE_SPAN = re.compile(INLINE_CODE, re.DOTALL)
 # Consume each complete construct before looking inside it. For example, a
 # fence inside an HTML comment must not hide prose after that comment ends.
 LITERAL = re.compile(
-    r"(?P<backtick_block>^ {0,3}(?P<backticks>`{3,})(?!`)[^`\n]*(?:\n|$).*?"
-    r"(?:^ {0,3}(?P=backticks)`*[ \t]*(?:\n|$)|\Z))"
-    r"|(?P<tilde_block>^ {0,3}(?P<tildes>~{3,})(?!~)[^\n]*(?:\n|$).*?"
-    r"(?:^ {0,3}(?P=tildes)~*[ \t]*(?:\n|$)|\Z))"
+    r"(?P<fence>^ {0,3}(?:`{3,}[^`\n]*|~{3,}[^\n]*)(?:\n|$))"
     r"|(?P<indented>^(?: {4}|\t)[^\n]*(?:\n|$))"
     r"|(?P<comment><!--.*?(?:-->|\Z))"
     r"|(?P<inline>" + INLINE_CODE + r")",
@@ -24,6 +21,7 @@ LITERAL = re.compile(
 )
 WIKILINK = re.compile(r"(?<!\\)\[\[([^\]\n]*)\]\]")
 LIST_ITEM = re.compile(r"^ {0,3}(?:[-+*]|\d{1,9}[.)]) {1,4}(?=\S)")
+BLOCK_QUOTE = re.compile(r"^ {0,3}>[ \t]?")
 FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})([^\n]*)")
 
 
@@ -32,34 +30,89 @@ def blank(text):
     return re.sub(r"[^\n]", " ", text)
 
 
-def list_relative_lines(lines):
-    """Remove list container indentation before testing for code indentation."""
-    indents = []
+def expand_indent(line):
+    prefix = re.match(r"^[ \t]*", line)[0]
+    return prefix.expandtabs(4) + line[len(prefix):]
+
+
+def closes_fence(line, fence):
+    closing = FENCE.match(line)
+    return closing and closing[1].startswith(fence) and not closing[2].strip(" \t")
+
+
+def container_lines(lines):
+    """Strip container prefixes while retaining each list item or quote's identity."""
+    # Sibling list items can have the same indentation and different fence boundaries.
+    containers = []
     fence = None
     for line in lines:
-        if not line.strip():
-            yield line
-            continue
+        relative = expand_indent(line)
+        matched = 0
+        for width, _ in containers:
+            if width is None:
+                quote = BLOCK_QUOTE.match(relative)
+                if not quote:
+                    break
+                relative = expand_indent(relative[quote.end():])
+            elif relative.strip():
+                if not relative.startswith(" " * width):
+                    break
+                relative = relative[width:]
+            matched += 1
 
-        prefix = re.match(r"^[ \t]*", line)[0]
-        indent = len(prefix.expandtabs(4))
-        while indents and indents[-1] > indent:
-            indents.pop()
-        container = indents[-1] if indents else 0
-        relative = " " * (indent - container) + line[len(prefix):]
+        if matched < len(containers):
+            del containers[matched:]
+            fence = None
+
         if fence is None:
-            item = LIST_ITEM.match(relative)
-            if item:
-                indents.append(container + item.end())
-                relative = relative[item.end():]
+            while True:
+                quote = BLOCK_QUOTE.match(relative)
+                item = LIST_ITEM.match(relative)
+                if quote:
+                    containers.append((None, object()))
+                    relative = expand_indent(relative[quote.end():])
+                elif item:
+                    containers.append((item.end(), object()))
+                    relative = relative[item.end():]
+                else:
+                    break
             opening = FENCE.match(relative)
             if opening and (opening[1][0] == "~" or "`" not in opening[2]):
                 fence = opening[1]
-        else:
-            closing = FENCE.match(relative)
-            if closing and closing[1].startswith(fence) and not closing[2].strip():
-                fence = None
-        yield relative
+        elif closes_fence(relative, fence):
+            fence = None
+        yield relative, containers[-1][1] if containers else None
+
+
+def mask_literals(lines):
+    body = "".join(line for line, _ in lines)
+    offsets = [0]
+    for line, _ in lines:
+        offsets.append(offsets[-1] + len(line))
+
+    parts = []
+    position = 0
+    while True:
+        match = LITERAL.search(body, position)
+        if not match:
+            parts.append(body[position:])
+            return "".join(parts)
+        parts.append(body[position:match.start()])
+        position = match.end()
+        if match["fence"]:
+            opening = bisect.bisect_right(offsets, match.start()) - 1
+            fence = FENCE.match(match[0])[1]
+            container = lines[opening][1]
+            end = opening + 1
+            # An unclosed fence ends with its list item or block quote.
+            while end < len(lines) and lines[end][1] is container:
+                line = lines[end][0]
+                end += 1
+                if closes_fence(line, fence):
+                    break
+            position = offsets[end]
+        literal = body[match.start():position]
+        parts.append(literal if match["inline"] else blank(literal))
 
 
 def markdown_body(text):
@@ -73,8 +126,7 @@ def markdown_body(text):
                 break
         else:
             break
-    body = "".join(list_relative_lines(lines))
-    return LITERAL.sub(lambda m: m[0] if m["inline"] else blank(m[0]), body)
+    return mask_literals(list(container_lines(lines)))
 
 
 def heading_text(text):
